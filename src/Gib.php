@@ -181,6 +181,9 @@ class Gib
             $this->setCredentials($username, $password);
         }
 
+        Client::resetSession();
+        Client::setOrigin($this->getPortalBaseUrl());
+
         $response = new Client($this->getGateway('login'), [
             'assoscmd' => $this->testMode ? 'login' : 'anologin',
             'userid'   => $this->username,
@@ -190,6 +193,7 @@ class Gib
         ]);
 
         $this->setToken($response->get('token'));
+        $this->bootPortalSession();
         return $this;
     }
     
@@ -205,6 +209,7 @@ class Gib
 
         $this->setCredentials();
         $this->setToken();
+        Client::resetSession();
         return true;
     }
         
@@ -308,9 +313,18 @@ class Gib
      */
     public function createDraft(ModelInterface|array $data): bool
     {
-        if ($data instanceof ModelInterface) {
-            $this->setLastId($data->getUuid());
-            $data = $data->export();
+        $model = $data instanceof ModelInterface ? $data : null;
+        if ($model) {
+            $data = $model->export();
+        }
+
+        $isInvoiceCreate = $this->documentType === DocumentType::Invoice
+            && empty($data['belgeNumarasi'] ?? '');
+
+        // GIB portal create akışında yeni faturalar boş faturaUuid ile gönderiliyor.
+        if ($isInvoiceCreate) {
+            $data['faturaUuid'] = '';
+            unset($data['ettn']);
         }
 
         $requestPath = match ($this->documentType) {
@@ -326,6 +340,22 @@ class Gib
         if (!str_contains($response->object('data'), 'başarıyla')) {
             throw new ApiException($response->object('data'), $data, $response);
         }
+
+        if ($isInvoiceCreate) {
+            $createdDocument = $this->getLastDocument();
+            $createdUuid = $createdDocument['ettn'] ?? '';
+
+            if ($createdUuid !== '') {
+                $this->setLastId($createdUuid);
+
+                if ($model && property_exists($model, 'uuid')) {
+                    $model->uuid = $createdUuid;
+                }
+            }
+        } elseif ($model) {
+            $this->setLastId($model->getUuid());
+        }
+
         return true;
     }
 
@@ -370,7 +400,11 @@ class Gib
                 'ettn' => $this->setUuid($uuid)
             ])
         );
-        return $response->get('data');
+        $document = $response->get('data');
+        if (is_array($document) && !isset($document['ettn'])) {
+            $document['ettn'] = $uuid;
+        }
+        return $document;
     }
 
     /**
@@ -761,6 +795,34 @@ class Gib
             'pageName' => $pageName,
             'jp'       => json_encode($payload ?: (object) $payload),
         ];
+    }
+
+    protected function getPortalBaseUrl(): string
+    {
+        return $this->testMode
+            ? self::API['gateways']['test']
+            : self::API['gateways']['prod'];
+    }
+
+    protected function bootPortalSession(): void
+    {
+        $portalVersion = (string) round(microtime(true) * 1000);
+        $portalBaseUrl = $this->getPortalBaseUrl();
+
+        new Client($portalBaseUrl . '/index.jsp', [
+            'token' => $this->token,
+            'v'     => $portalVersion,
+        ], false, [
+            'expect_json' => false,
+            'headers' => [
+                'referer' => $portalBaseUrl . '/intragiris.html',
+            ],
+        ]);
+
+        Client::setReferer($portalBaseUrl . '/index.jsp?' . http_build_query([
+            'token' => $this->token,
+            'v'     => $portalVersion,
+        ]));
     }
         
     /**
